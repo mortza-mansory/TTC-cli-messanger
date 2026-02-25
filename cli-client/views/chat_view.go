@@ -3,6 +3,7 @@ package views
 import (
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -12,6 +13,11 @@ import (
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
 )
+
+// DebugLogFile is set by main so renderMessages can flush before SetText.
+// A hard crash inside tview.SetText would otherwise lose the last log lines
+// since they're buffered. Flush guarantees the trace is on disk.
+var DebugLogFile *os.File
 
 type ChatView struct {
 	app           *tview.Application
@@ -71,7 +77,11 @@ func NewChatView(
 		headerOnline:  true,
 		inFlight:      make(map[int]string),
 	}
-	atomic.StoreInt32(&c.animMode, 1)
+	// Default to STATIC mode. Animation mode (word-by-word) involves a
+	// goroutine that reads from a channel while holding a QueueUpdateDraw
+	// slot — if that path is the crash source, static mode will stay stable.
+	// Users can switch with /mode animation once confirmed working.
+	atomic.StoreInt32(&c.animMode, 0)
 	c.buildUI()
 	c.startClockTicker()
 	return c
@@ -211,18 +221,52 @@ func sanitizeContent(s string) string {
 	return strings.ReplaceAll(s, "[", "[[]")
 }
 
+// safeColorTag validates that a color tag from external sources is well-formed
+// before inserting it raw into a tview format string.
+//
+// A valid tview color tag must:
+//   - Start with "["
+//   - End with "]"
+//   - Contain no nested "[" that would start a second tag
+//
+// Anything that doesn't satisfy these rules is replaced with "[white]" so we
+// never hand tview a malformed tag that would cause a fatal index panic.
+func safeColorTag(tag string) string {
+	if len(tag) < 3 {
+		return "[white]"
+	}
+	if tag[0] != '[' || tag[len(tag)-1] != ']' {
+		return "[white]"
+	}
+	// Must not contain a second "[" inside (would nest tags)
+	inner := tag[1 : len(tag)-1]
+	if strings.ContainsAny(inner, "[]") {
+		return "[white]"
+	}
+	return tag
+}
+
 // renderMessages rebuilds the messageView from the committed buffer plus all
 // active in-flight animation lines. Must always be called from the tview event loop.
 func (c *ChatView) renderMessages() {
+	log.Printf("TRACE renderMessages: committedLen=%d inFlightCount=%d nextAnimID=%d",
+		len(c.committedText), len(c.inFlight), c.nextAnimID)
 	text := c.committedText
-	// Append in-flight lines in insertion order (IDs are sequential integers).
 	for i := 0; i < c.nextAnimID; i++ {
 		if line, ok := c.inFlight[i]; ok {
 			text += line
 		}
 	}
+	log.Printf("TRACE renderMessages: total text len=%d calling SetText", len(text))
+	// Flush to disk BEFORE SetText — if tview crashes inside SetText (e.g. from
+	// a bad color tag sequence we missed), the log is already on disk.
+	if DebugLogFile != nil {
+		DebugLogFile.Sync()
+	}
 	c.messageView.SetText(text)
+	log.Printf("TRACE renderMessages: SetText done, calling ScrollToEnd")
 	c.messageView.ScrollToEnd()
+	log.Printf("TRACE renderMessages: DONE")
 }
 
 // ── Message formatting ────────────────────────────────────────────────────
@@ -236,25 +280,34 @@ func (c *ChatView) renderMessages() {
 // [[] is tview's escape sequence for a literal "[" character.
 func formatLine(msg *models.Message) string {
 	if msg.IsSystem {
-		return fmt.Sprintf("[yellow]▸ %s[-]\n", sanitizeContent(msg.Content))
+		// System messages are trusted internal strings — they may contain tview
+		// color markup like [cyan]name[-] intentionally. Do NOT sanitize them.
+		return fmt.Sprintf("[yellow]▸ %s[-]\n", msg.Content)
 	}
-	color := msg.Color
+	color := safeColorTag(msg.Color)
 	if color == "" {
 		color = "[white]"
 	}
-	// sanitizeContent escapes [ in username and content so tview never
-	// misinterprets user-supplied text as a color/style tag.
-	return fmt.Sprintf("[dim][[]%s][-] %s[[]%s][-] %s%s[-]\n",
-		msg.FormatTime(), color,
-		sanitizeContent(msg.Username), color,
-		sanitizeContent(msg.Content))
+	ts := msg.FormatTime()
+	safeUser := sanitizeContent(msg.Username) // escapes [ inside username
+	safeContent := sanitizeContent(msg.Content)
+	// [ts] and [username] are NOT valid tview color names so tview passes them
+	// through as literal bracket-wrapped text — no [[] escaping needed.
+	return fmt.Sprintf("[gray][%s][-] %s[%s][-]%s %s[-]\n",
+		ts, color, safeUser, color, safeContent)
 }
 
 // incomingPrefix builds the formatted prefix for an incoming message line.
-// Used by both static and animated rendering paths.
+//
+// We do NOT escape [ with [[] here. tview passes unrecognised tags (those
+// whose content is not a valid color name) through as literal text.
+// [10:48] and [username] are never valid tview colors, so they display as-is.
+// Real color directives like [red] and [-] work as normal.
 func incomingPrefix(colorTag, username string) string {
-	return fmt.Sprintf("[dim][[]%s][-] %s[[]%s][-] %s",
-		time.Now().Format("15:04"), colorTag, username, colorTag)
+	ts := time.Now().Format("15:04")
+	safeUser := sanitizeContent(username) // escapes any [ inside the username itself
+	return fmt.Sprintf("[gray][%s][-] %s[%s][-]%s ",
+		ts, colorTag, safeUser, colorTag)
 }
 
 // ── Public message API ────────────────────────────────────────────────────
@@ -282,30 +335,40 @@ func (c *ChatView) AddMessage(msg *models.Message) {
 //
 // Safe to call from any goroutine.
 func (c *ChatView) AddIncomingMessage(username, content, colorTag string) {
+	log.Printf("TRACE AddIncomingMessage: ENTER user=%q color=%q content=%.80q", username, colorTag, content)
+
 	if atomic.LoadInt32(&c.stopped) == 1 {
-		log.Printf("AddIncomingMessage: stopped, dropping msg from %s", username)
+		log.Printf("TRACE AddIncomingMessage: view stopped, dropping msg from %q", username)
 		return
 	}
 
-	// Normalise color tag
+	// Normalise and validate color tag.
+	// safeColorTag MUST run last — it rejects any tag that would crash tview.
 	if colorTag == "" {
 		colorTag = models.GetUsernameColor(username)
 	}
 	if !strings.HasPrefix(colorTag, "[") {
 		colorTag = models.ParseColorToTag(colorTag)
 	}
+	colorTag = safeColorTag(colorTag) // reject malformed tags from the server
+	log.Printf("TRACE AddIncomingMessage: normalised+validated colorTag=%q", colorTag)
 
 	words := strings.Fields(content)
+	log.Printf("TRACE AddIncomingMessage: word count=%d", len(words))
 	if len(words) == 0 {
 		return
 	}
 
 	prefix := incomingPrefix(colorTag, username)
+	log.Printf("TRACE AddIncomingMessage: prefix built, animMode=%d", atomic.LoadInt32(&c.animMode))
 
 	// ── STATIC mode ────────────────────────────────────────────────────────
 	if atomic.LoadInt32(&c.animMode) == 0 {
+		log.Printf("TRACE AddIncomingMessage: static mode, queuing draw for user=%q", username)
 		c.app.QueueUpdateDraw(func() {
+			log.Printf("TRACE static draw: ENTER event loop for user=%q", username)
 			if atomic.LoadInt32(&c.stopped) == 1 {
+				log.Printf("TRACE static draw: stopped, bailing")
 				return
 			}
 			defer func() {
@@ -313,9 +376,16 @@ func (c *ChatView) AddIncomingMessage(username, content, colorTag string) {
 					log.Printf("PANIC static draw (from %s): %v", username, r)
 				}
 			}()
-			c.committedText += prefix + sanitizeContent(content) + "[-]\n"
+			sanitized := sanitizeContent(content)
+			log.Printf("TRACE static draw: sanitized content=%.80q", sanitized)
+			log.Printf("TRACE static draw: committedText len before=%d", len(c.committedText))
+			c.committedText += prefix + sanitized + "[-]\n" // prefix already ends with colorTag
+			log.Printf("TRACE static draw: committedText len after=%d inFlight count=%d", len(c.committedText), len(c.inFlight))
+			log.Printf("TRACE static draw: calling renderMessages")
 			c.renderMessages()
+			log.Printf("TRACE static draw: renderMessages returned")
 		})
+		log.Printf("TRACE AddIncomingMessage: static QueueUpdateDraw enqueued")
 		return
 	}
 
@@ -325,9 +395,11 @@ func (c *ChatView) AddIncomingMessage(username, content, colorTag string) {
 	// idCh carries both the animID and the inFlightGen at allocation time.
 	// The animation goroutine uses gen to detect if ClearMessages() ran while
 	// it was mid-flight, so it can discard stale word-tick callbacks.
+	log.Printf("TRACE AddIncomingMessage: anim mode, allocating slot for user=%q", username)
 	type animSlot struct{ id, gen int }
 	slotCh := make(chan animSlot, 1)
 	c.app.QueueUpdateDraw(func() {
+		log.Printf("TRACE anim-init: ENTER event loop for user=%q", username)
 		defer func() {
 			if r := recover(); r != nil {
 				log.Printf("PANIC anim-init (from %s): %v", username, r)
@@ -335,16 +407,21 @@ func (c *ChatView) AddIncomingMessage(username, content, colorTag string) {
 			}
 		}()
 		if atomic.LoadInt32(&c.stopped) == 1 {
+			log.Printf("TRACE anim-init: stopped, sending -1 slot")
 			slotCh <- animSlot{-1, -1}
 			return
 		}
 		animID := c.nextAnimID
 		c.nextAnimID++
 		gen := c.inFlightGen
+		log.Printf("TRACE anim-init: allocated animID=%d gen=%d inFlight count=%d", animID, gen, len(c.inFlight))
 		c.inFlight[animID] = prefix + "[dim]▋[-]"
 		slotCh <- animSlot{animID, gen}
+		log.Printf("TRACE anim-init: calling renderMessages")
 		c.renderMessages()
+		log.Printf("TRACE anim-init: renderMessages returned, sent slot")
 	})
+	log.Printf("TRACE AddIncomingMessage: anim init QueueUpdateDraw enqueued")
 
 	// Step 2 (goroutine): drip words one at a time, updating only our slot.
 	go func() {
@@ -354,8 +431,11 @@ func (c *ChatView) AddIncomingMessage(username, content, colorTag string) {
 			}
 		}()
 
+		log.Printf("TRACE anim-goroutine: waiting for slot user=%q", username)
 		slot := <-slotCh
+		log.Printf("TRACE anim-goroutine: got slot id=%d gen=%d user=%q", slot.id, slot.gen, username)
 		if slot.id < 0 || atomic.LoadInt32(&c.stopped) == 1 {
+			log.Printf("TRACE anim-goroutine: aborting (id=%d stopped=%d)", slot.id, atomic.LoadInt32(&c.stopped))
 			return
 		}
 		animID := slot.id
@@ -382,31 +462,35 @@ func (c *ChatView) AddIncomingMessage(username, content, colorTag string) {
 			isLast := i == len(words)-1
 			snapshot := built
 
+			wordIdx := i
 			c.app.QueueUpdateDraw(func() {
+				log.Printf("TRACE word-tick: ENTER event loop animID=%d word[%d]=%q isLast=%v user=%q", animID, wordIdx, snapshot, isLast, username)
 				defer func() {
 					if r := recover(); r != nil {
 						log.Printf("PANIC word-anim draw (from %s): %v", username, r)
 					}
 				}()
 				if atomic.LoadInt32(&c.stopped) == 1 {
+					log.Printf("TRACE word-tick: stopped, bailing animID=%d", animID)
 					return
 				}
-				// If inFlightGen changed since we started, ClearMessages() ran.
-				// Discard this callback — the map has been replaced and the
-				// committed text has been wiped. Writing would be stale.
 				if c.inFlightGen != myGen {
+					log.Printf("TRACE word-tick: stale gen (mine=%d current=%d), bailing animID=%d", myGen, c.inFlightGen, animID)
 					return
 				}
+				sanitized := sanitizeContent(snapshot)
+				log.Printf("TRACE word-tick: sanitized=%.60q committedLen=%d inFlightCount=%d", sanitized, len(c.committedText), len(c.inFlight))
 				if isLast {
-					// Commit the finished line — remove from inFlight, append to committed.
+					log.Printf("TRACE word-tick: LAST WORD — committing animID=%d", animID)
 					delete(c.inFlight, animID)
-					c.committedText += prefix + sanitizeContent(snapshot) + "[-]\n"
+					c.committedText += prefix + sanitized + "[-]\n"
+					log.Printf("TRACE word-tick: committed, new committedLen=%d", len(c.committedText))
 				} else {
-					// Still typing — update the in-flight slot only.
-					// sanitizeContent ensures [ in content never triggers tview tag parsing.
-					c.inFlight[animID] = prefix + sanitizeContent(snapshot) + " [dim]▋[-]"
+					c.inFlight[animID] = prefix + sanitized + " [dim]▋[-]"
 				}
+				log.Printf("TRACE word-tick: calling renderMessages animID=%d", animID)
 				c.renderMessages()
+				log.Printf("TRACE word-tick: renderMessages returned animID=%d", animID)
 			})
 		}
 	}()
@@ -500,8 +584,22 @@ func (c *ChatView) SetCurrentUser(username string) {
 }
 
 // SetOnlineStatus updates the ●ONLINE/●OFFLINE indicator in the header.
-// Safe to call from any goroutine.
+//
+// MUST be called from within the tview event loop (i.e. from inside a
+// QueueUpdateDraw callback). It does NOT call QueueUpdateDraw itself —
+// doing so from inside an existing callback would nest queue calls and
+// deadlock tview's updates channel on Windows.
 func (c *ChatView) SetOnlineStatus(online bool) {
+	if atomic.LoadInt32(&c.stopped) == 1 {
+		return
+	}
+	c.headerOnline = online
+	c.redrawHeader()
+}
+
+// SetOnlineStatusAsync updates the online indicator from any goroutine.
+// Use this ONLY when NOT already inside a QueueUpdateDraw callback.
+func (c *ChatView) SetOnlineStatusAsync(online bool) {
 	if atomic.LoadInt32(&c.stopped) == 1 {
 		return
 	}

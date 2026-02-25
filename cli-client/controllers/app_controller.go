@@ -97,11 +97,11 @@ func (ac *AppController) OnCommand(command string) {
 
 	case "info":
 		lines := []string{
-			"[dim]┌─ SecTherminal ──────────────────────────────────────────────┐[-]",
+			"[dim]┌─ TTC ──────────────────────────────────────────────┐[-]",
 			"  A lightweight, encrypted terminal messenger built in Go.",
 			"  Designed for speed, privacy, and minimal footprint.",
 			"",
-			"  [cyan]Author   [-]SecTherminal contributors",
+			"  [cyan]Author   [-]Mortza Mansory -- https://mortza-mansory.github.io/",
 			"  [cyan]License  [-]MIT — free and open-source",
 			"  [cyan]GitHub   [-]https://github.com/SecTherminal/sectherminal",
 			"  [cyan]Version  [-]v1.0.0-dev",

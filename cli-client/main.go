@@ -1,9 +1,12 @@
+//go:build windows
+
 package main
 
 import (
 	"fmt"
 	"log"
 	"os"
+	"runtime/debug"
 	"time"
 
 	"cli-client/controllers"
@@ -11,40 +14,104 @@ import (
 	"cli-client/views"
 
 	"github.com/rivo/tview"
+	"golang.org/x/sys/windows"
 )
 
 var logFile *os.File
 
 func init() {
 	var err error
-	logFile, err = os.Create("error.txt")
+	// Open with append+create so multiple runs accumulate — easier to correlate
+	// a crash with the session that produced it.
+	logFile, err = os.OpenFile("error.txt",
+		os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
-		fmt.Println("Failed to create error log file:", err)
+		fmt.Println("Failed to open error log file:", err)
+		return
 	}
+
+	// SetStdHandle replaces the process stderr handle with our log file so
+	// the runtime crash dump and goroutine stacks land in error.txt.
+	if err := windows.SetStdHandle(
+		windows.STD_ERROR_HANDLE,
+		windows.Handle(logFile.Fd()),
+	); err != nil {
+		fmt.Println("Warning: could not redirect stderr to error.txt:", err)
+	}
+
+	// Also wire up the standard logger to the same file.
+	log.SetOutput(&syncWriter{f: logFile})
+
+	// Give chat_view.go access to the file handle so it can flush before
+	// every tview SetText call — ensures traces are on disk even on hard crashes.
+	views.DebugLogFile = logFile
+	// syncWriter flushes to disk on every write — no log line lost on hard crash
+	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds | log.Lshortfile)
+
+	// Write a session header so different runs are clearly separated in the file.
+	separator := fmt.Sprintf(
+		"\n════════════════════════════════════════════════════════\n"+
+			"  TTC session started  %s\n"+
+			"════════════════════════════════════════════════════════\n",
+		time.Now().Format("2006-01-02 15:04:05"),
+	)
+	logFile.WriteString(separator)
+	logFile.Sync()
+}
+
+// logError writes a timestamped error line to error.txt and stderr.
+// syncWriter wraps an *os.File and calls Sync() after every Write so that
+// log lines are guaranteed to be on disk even if the process is hard-killed.
+type syncWriter struct{ f *os.File }
+
+func (w *syncWriter) Write(p []byte) (n int, err error) {
+	n, err = w.f.Write(p)
+	w.f.Sync() // flush OS page cache → disk on every log line
+	return
 }
 
 func logError(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
-	timestamp := time.Now().Format("2006-01-02 15:04:05")
-	logLine := fmt.Sprintf("[%s] ERROR: %s\n", timestamp, msg)
-	fmt.Print(logLine)
+	line := fmt.Sprintf("[%s] ERROR: %s\n",
+		time.Now().Format("2006-01-02 15:04:05.000"), msg)
 	if logFile != nil {
-		logFile.WriteString(logLine)
+		logFile.WriteString(line)
 		logFile.Sync()
 	}
 }
 
+// recoverFromPanic is called via defer in goroutines. It catches software
+// panics (interface conversion, nil dereference that reached user code, etc.)
+// and writes the full stack trace to error.txt before re-returning.
+// Fatal runtime errors (concurrent map writes, etc.) are NOT caught here —
+// they are captured by the stderr redirect set up in init().
 func recoverFromPanic() {
 	if r := recover(); r != nil {
-		logError("PANIC RECOVERED: %v", r)
+		entry := fmt.Sprintf(
+			"[%s] PANIC RECOVERED: %v\n--- stack trace ---\n%s-------------------\n",
+			time.Now().Format("2006-01-02 15:04:05.000"),
+			r,
+			string(debug.Stack()),
+		)
+		if logFile != nil {
+			logFile.WriteString(entry)
+			logFile.Sync()
+		}
 	}
 }
 
 func main() {
 	defer func() {
 		if r := recover(); r != nil {
-			logError("FATAL PANIC in main: %v", r)
+			entry := fmt.Sprintf(
+				"[%s] FATAL PANIC in main: %v\n--- stack trace ---\n%s-------------------\n",
+				time.Now().Format("2006-01-02 15:04:05.000"),
+				r,
+				string(debug.Stack()),
+			)
 			if logFile != nil {
+				logFile.WriteString(entry)
+				logFile.Sync()
 				logFile.Close()
 			}
 			os.Exit(1)
@@ -80,7 +147,6 @@ func main() {
 		go func() {
 			defer recoverFromPanic()
 
-			// ── Phase 1: animate the progress bar ─────────────────────────────
 			steps := []struct {
 				progress int
 				label    string
@@ -101,13 +167,11 @@ func main() {
 				}
 			}
 
-			// ── Phase 2: real connectivity check ──────────────────────────────
 			loadingView.SetStatus("Contacting relay server…")
 			connErr := controllers.CheckServerConnectivity(controllers.DefaultServerURL)
 
 			if connErr != nil {
-				// ── FAILURE PATH ──────────────────────────────────────────────
-				// Paint the fatal error banner immediately.
+				logError("Server connectivity check failed: %v", connErr)
 				app.QueueUpdateDraw(func() {
 					defer recoverFromPanic()
 					loadingView.ShowFatalError(
@@ -116,27 +180,21 @@ func main() {
 					loadingView.SetCountdown(4)
 				})
 
-				// Tick the countdown 4 → 3 → 2 → 1 then exit.
 				for i := 3; i >= 0; i-- {
 					time.Sleep(1 * time.Second)
 					remaining := i
 					app.QueueUpdateDraw(func() {
 						defer recoverFromPanic()
-						if remaining == 0 {
-							loadingView.SetCountdown(0)
-						} else {
-							loadingView.SetCountdown(remaining)
-						}
+						loadingView.SetCountdown(remaining)
 					})
 				}
 
-				// Give the last frame one render cycle then stop the app.
 				time.Sleep(200 * time.Millisecond)
 				app.Stop()
 				return
 			}
 
-			// ── SUCCESS PATH ──────────────────────────────────────────────────
+			log.Printf("Server reachable at %s", controllers.DefaultServerURL)
 			loadingView.SetStatus("Connected  ✓")
 			time.Sleep(300 * time.Millisecond)
 
@@ -171,8 +229,6 @@ func main() {
 		}
 	})
 
-	// Kick off the state machine from a goroutine so the tview event loop is
-	// already running by the time the first Transition fires.
 	go func() {
 		defer recoverFromPanic()
 		time.Sleep(100 * time.Millisecond)
@@ -184,9 +240,9 @@ func main() {
 
 	if err := app.SetRoot(pages, true).Run(); err != nil {
 		logError("Application error: %v", err)
-		log.Printf("Application error: %v", err)
 	}
 
+	log.Printf("Application exited cleanly")
 	if logFile != nil {
 		logFile.Close()
 	}
