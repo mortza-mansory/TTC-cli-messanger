@@ -330,17 +330,6 @@ This stops spam and DoS attacks.
 
 ## Troubleshooting
 
-### "Port already in use"
-```bash
-# Find what's using the port (Windows)
-netstat -ano | findstr :8034
-taskkill /PID <PID> /F
-
-# Linux/macOS
-lsof -i :8034
-kill -9 <PID>
-```
-
 ### "Connection refused"
 - Is the server running?
 - Check the port number
