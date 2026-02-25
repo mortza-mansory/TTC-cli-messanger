@@ -1,5 +1,5 @@
-# Cli Messenger
-A simple CLI messenger client and backend (server) using tcell/tview and HTTP Long Polling for maximum safety in private messaging. Bring secure messaging to your terminal from 2000 to 2026.
+# TTC - Terminal Talk Cli
+A simple TGUI messenger client and backend (server) using tcell/tview and HTTP Long Polling for maximum safety in private messaging. Bring secure messaging to your terminal from 2000 to 2026.
 
 ## Why This Project?
 Most messaging apps today are too complicated. They use WebSockets (which can be hacked), store your messages forever, and know too much about you. This project is different:
